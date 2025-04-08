@@ -1,64 +1,115 @@
-import pandas as pd
-import numpy as np
-import random
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, ChiSqSelector
+from pyspark.ml.classification import LogisticRegression, DecisionTreeClassifier, RandomForestClassifier, GBTClassifier
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 
-# Define data for each column
-def generate_customer_churn_data(num_customers=1000):
-    customerID = [f"CUST{str(i).zfill(5)}" for i in range(1, num_customers + 1)]
-    gender = [random.choice(["Male", "Female"]) for _ in range(num_customers)]
-    
-    # Senior citizens have a higher chance to churn but not overly so
-    senior_citizen = [random.choices([0, 1], weights=[0.8, 0.2])[0] for _ in range(num_customers)]
-    
-    # Tenure distribution: more short-tenure and long-tenure customers
-    tenure = [random.randint(0, 12) if random.random() < 0.4 else random.randint(12, 72) for _ in range(num_customers)]
-    
-    # Monthly charges with more overlap
-    monthly_charges = [round(random.uniform(60, 110) if tenure[i] < 12 else random.uniform(20, 100), 2) for i in range(num_customers)]
-    
-    # Add some noise for TotalCharges based on MonthlyCharges and Tenure
-    total_charges = [
-        round(monthly_charges[i] * tenure[i] + random.uniform(-10, 10) * tenure[i] if tenure[i] > 0 else np.nan, 2) 
-        for i in range(num_customers)
-    ]
-    
-    # Phone and Internet Service with mixed churn rates
-    phone_service = [random.choice(["Yes", "No"]) for _ in range(num_customers)]
-    internet_service = [
-        random.choices(["DSL", "Fiber optic", "No"], weights=[0.4, 0.4, 0.2])[0] for _ in range(num_customers)
-    ]
-    
-    # Generate churn with less determinism and more complex conditions
-    churn = [
-        "Yes" if (
-            (tenure[i] < 12 and monthly_charges[i] > 70) or
-            (senior_citizen[i] == 1 and random.random() < 0.4) or
-            (internet_service[i] == "Fiber optic" and random.random() < 0.5)
-        ) and random.random() < 0.6  # Random noise for churn
-        else "No"
-        for i in range(num_customers)
-    ]
+# Initialize Spark session
+spark = SparkSession.builder.appName("CustomerChurnMLlib").getOrCreate()
 
-    # Compile the data into a DataFrame
-    data = {
-        "customerID": customerID,
-        "gender": gender,
-        "SeniorCitizen": senior_citizen,
-        "tenure": tenure,
-        "PhoneService": phone_service,
-        "InternetService": internet_service,
-        "MonthlyCharges": monthly_charges,
-        "TotalCharges": total_charges,
-        "Churn": churn
+# Load dataset
+data_path = "customer_churn.csv"
+df = spark.read.csv(data_path, header=True, inferSchema=True)
+
+# Task 1: Data Preprocessing and Feature Engineering
+def preprocess_data(df):
+    # Fill missing values in TotalCharges
+    df = df.withColumn("TotalCharges", when(col("TotalCharges").isNull(), 0).otherwise(col("TotalCharges")))
+
+    # List of categorical columns to index and encode
+    categorical_cols = ["gender", "PhoneService", "InternetService"]
+    indexers = [StringIndexer(inputCol=col, outputCol=col + "_Index") for col in categorical_cols]
+    encoders = [OneHotEncoder(inputCol=col + "_Index", outputCol=col + "_Vec") for col in categorical_cols]
+
+    # Label indexer for Churn column
+    label_indexer = StringIndexer(inputCol="Churn", outputCol="label")
+
+    # Apply indexers
+    for indexer in indexers:
+        df = indexer.fit(df).transform(df)
+    for encoder in encoders:
+        df = encoder.fit(df).transform(df)
+    df = label_indexer.fit(df).transform(df)
+
+    # Combine feature columns
+    feature_cols = ["SeniorCitizen", "tenure", "MonthlyCharges", "TotalCharges"] + [col + "_Vec" for col in categorical_cols]
+    assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+    final_df = assembler.transform(df).select("features", "label")
+
+    return final_df
+
+# Task 2: Splitting Data and Building a Logistic Regression Model
+def train_logistic_regression_model(df):
+    # Split data
+    train_data, test_data = df.randomSplit([0.8, 0.2], seed=42)
+
+    # Train logistic regression
+    lr = LogisticRegression(featuresCol="features", labelCol="label")
+    lr_model = lr.fit(train_data)
+
+    # Predict and evaluate
+    predictions = lr_model.transform(test_data)
+    evaluator = BinaryClassificationEvaluator(labelCol="label", metricName="areaUnderROC")
+    auc = evaluator.evaluate(predictions)
+    print(f"Logistic Regression AUC: {auc:.4f}")
+
+# Task 3: Feature Selection Using Chi-Square Test
+def feature_selection(df):
+    selector = ChiSqSelector(numTopFeatures=5, featuresCol="features", labelCol="label", outputCol="selectedFeatures")
+    result = selector.fit(df).transform(df)
+    print("Top 5 features selected using Chi-Square Test:")
+    result.select("selectedFeatures", "label").show(5, truncate=False)
+
+# Task 4: Hyperparameter Tuning with Cross-Validation for Multiple Models
+def tune_and_compare_models(df):
+    # Split data
+    train_data, test_data = df.randomSplit([0.8, 0.2], seed=42)
+    evaluator = BinaryClassificationEvaluator(labelCol="label", metricName="areaUnderROC")
+
+    models = {
+        "LogisticRegression": LogisticRegression(featuresCol="features", labelCol="label"),
+        "DecisionTree": DecisionTreeClassifier(featuresCol="features", labelCol="label"),
+        "RandomForest": RandomForestClassifier(featuresCol="features", labelCol="label"),
+        "GBT": GBTClassifier(featuresCol="features", labelCol="label")
     }
-    df = pd.DataFrame(data)
 
-    # Introduce some NaN values randomly in 'TotalCharges' column
-    nan_indices = np.random.choice(df.index, size=int(num_customers * 0.05), replace=False)
-    df.loc[nan_indices, 'TotalCharges'] = np.nan
+    param_grids = {
+        "LogisticRegression": ParamGridBuilder()
+            .addGrid(models["LogisticRegression"].regParam, [0.01, 0.1])
+            .build(),
 
-    return df
+        "DecisionTree": ParamGridBuilder()
+            .addGrid(models["DecisionTree"].maxDepth, [3, 5, 10])
+            .build(),
 
-# Generate the dataset
-df = generate_customer_churn_data(num_customers=1000)
-df.to_csv("./customer_churn.csv", index=False)
+        "RandomForest": ParamGridBuilder()
+            .addGrid(models["RandomForest"].numTrees, [10, 20])
+            .build(),
+
+        "GBT": ParamGridBuilder()
+            .addGrid(models["GBT"].maxIter, [10, 20])
+            .build()
+    }
+
+    for name, model in models.items():
+        print(f"\nTraining and tuning {name}...")
+        cv = CrossValidator(estimator=model,
+                            estimatorParamMaps=param_grids[name],
+                            evaluator=evaluator,
+                            numFolds=5)
+        cv_model = cv.fit(train_data)
+        best_model = cv_model.bestModel
+        predictions = best_model.transform(test_data)
+        auc = evaluator.evaluate(predictions)
+        print(f"Best {name} AUC: {auc:.4f}")
+        print(f"Best Params: {best_model.extractParamMap()}")
+
+# Execute tasks
+preprocessed_df = preprocess_data(df)
+train_logistic_regression_model(preprocessed_df)
+feature_selection(preprocessed_df)
+tune_and_compare_models(preprocessed_df)
+
+# Stop Spark session
+spark.stop()
